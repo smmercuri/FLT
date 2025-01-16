@@ -19,7 +19,7 @@ namespace ExtensionPlace
 
 variable {L}
 
-theorem abs_comp_eq {v : InfinitePlace K} (wv : v.ExtensionPlace L) (x : K) :
+theorem abs_comp {v : InfinitePlace K} (wv : v.ExtensionPlace L) (x : K) :
     wv.1 (algebraMap K L x) = v x := by
   simp_rw [← wv.2]; rfl
 
