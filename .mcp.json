@@ -34,6 +34,13 @@
       "args": [
           "tools/isdefeq_trace.py"
       ]
+    },
+    "decl-profile": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+          "tools/decl_profile.py"
+      ]
     }
   }
 }
