@@ -26,6 +26,25 @@
       "command": "python3",
       "args": [
           "tools/flt_profile_ranking.py"
+    "synth-trace": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+          "tools/synth_trace.py"
+      ]
+    },
+    "isdefeq-trace": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+          "tools/isdefeq_trace.py"
+      ]
+    },
+    "decl-profile": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+          "tools/decl_profile.py"
       ]
     }
   }
