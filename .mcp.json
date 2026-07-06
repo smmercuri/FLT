@@ -1,0 +1,32 @@
+{
+  "mcpServers": {
+    "lean-lsp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+          "lean-lsp-mcp"
+      ]
+    },
+    "flt-import-closure": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+          "tools/flt_import_closure.py"
+      ]
+    },
+    "record-log": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+          "tools/record_log.py"
+      ]
+    },
+    "flt-profile-ranking": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+          "tools/flt_profile_ranking.py"
+      ]
+    }
+  }
+}
