@@ -53,6 +53,7 @@ Or measure directly (bypassing MCP), e.g. the first 2 modules:
 import datetime
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -265,20 +266,27 @@ def _dependents(seed: set, rev: dict, mode: str, universe: set) -> set:
 
 
 # --------------------------------------------------------------------------- #
-# Measurement: inject #count_heartbeats above each decl, compile once, restore
+# Measurement: inject #count_heartbeats above each decl into a SIBLING TEMP FILE
+# (same directory, so imports/module resolution match), compile it, delete it.
+# The tracked source file is only ever READ -- never written -- so a kill or a
+# concurrent git operation can never corrupt the working tree.
 # (reuses decl_profile's helpers so file total == sum of decl_profile per-decl)
 # --------------------------------------------------------------------------- #
 
+# Sibling temp files carry this suffix; it is gitignored so a leftover from a
+# hard kill can never be staged/committed.
+_TMP_SUFFIX = ".hbtmp.lean"
+
+
 def _measure_file(module: str, timeout: float) -> dict:
     """Return {total_heartbeats, decl_count, per_decl:[{decl,heartbeats}], error}.
-    The source file is ALWAYS restored."""
+    Injects into a sibling temp file; the source file is never modified."""
     path = _module_to_path(module)
     if not path.is_file():
         return {"error": "file not found", "total_heartbeats": None,
                 "decl_count": None, "per_decl": []}
 
-    original = path.read_text()
-    lines = original.splitlines(keepends=True)
+    lines = path.read_text().splitlines(keepends=True)
     decls = decl_profile._find_decls(lines)
     if not decls:
         return {"error": "no top-level declarations", "total_heartbeats": 0,
@@ -292,25 +300,30 @@ def _measure_file(module: str, timeout: float) -> dict:
     for idx, text in sorted(insertions, key=lambda t: t[0], reverse=True):
         lines.insert(idx, text)
 
-    rel = path.relative_to(_PROJECT_ROOT)
+    # Sibling temp file in the SAME directory (module resolves like the original);
+    # pid-tagged so parallel measurements never collide.
+    tmp = path.with_name(f"{path.stem}.{os.getpid()}{_TMP_SUFFIX}")
     output = ""
     try:
-        path.write_text("".join(lines))
+        tmp.write_text("".join(lines))
         proc = subprocess.run(
-            ["lake", "env", "lean", str(rel)],
+            ["lake", "env", "lean", str(tmp.relative_to(_PROJECT_ROOT))],
             cwd=str(_PROJECT_ROOT),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             timeout=timeout,
         )
         output = proc.stdout.decode("utf-8", "replace")
     except subprocess.TimeoutExpired:
-        return {"error": f"timed out after {timeout}s (file restored)",
+        return {"error": f"timed out after {timeout}s",
                 "total_heartbeats": None, "decl_count": None, "per_decl": []}
     except Exception as e:  # noqa: BLE001
-        return {"error": f"{type(e).__name__}: {e} (file restored)",
+        return {"error": f"{type(e).__name__}: {e}",
                 "total_heartbeats": None, "decl_count": None, "per_decl": []}
     finally:
-        path.write_text(original)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
     used = [int(m.group(1)) for line in output.splitlines()
             if (m := decl_profile._USED_RE.search(line))]
@@ -554,6 +567,13 @@ def run(mode=DEFAULT_MODE, modules=None, closure_json=None,
             snap_rel = _write_pass_snapshot(files_tbl, order, remeasured,
                                             pass_no, stage)
             report += f"\n\n(pass {stage} snapshot: {snap_rel})"
+            frozen = _freeze_tables_to_pass(pass_no, stage)
+            if frozen:
+                report += (f"\n(frozen full tables in pass dir: "
+                           f"{len(frozen)} file(s))")
+            else:
+                report += ("\n(no static tables to freeze yet -- run mode=bootstrap "
+                           "first)")
         if table_changed:
             report += (f"\n(updated static tables: "
                        f"{FILES_TABLE_TXT.relative_to(_PROJECT_ROOT)}, "
@@ -622,6 +642,21 @@ def _write_pass_snapshot(files_tbl, order, remeasured, pass_no, stage):
         } for i, m in enumerate(snap_ranked, 1)],
     }, indent=2) + "\n")
     return str(pass_path.relative_to(_PROJECT_ROOT))
+
+
+def _freeze_tables_to_pass(pass_no, stage):
+    """Copy the FULL static tables (files + decls, json + txt) into the pass/stage
+    dir as a frozen, pass-time snapshot. Unlike flt_heartbeat_ranking.json (which is
+    scoped to the pass's selection), these are the complete tables, so improvements
+    can be compared across passes (e.g. diff Pass_1/after/metrics_files.json against
+    Pass_2/after/metrics_files.json). Returns the list of copied repo-relative paths."""
+    dest = cache_paths.pass_dir(pass_no, stage)
+    copied = []
+    for src in (FILES_TABLE_JSON, FILES_TABLE_TXT, DECLS_TABLE_JSON, DECLS_TABLE_TXT):
+        if src.is_file():
+            (dest / src.name).write_text(src.read_text())
+            copied.append(str((dest / src.name).relative_to(_PROJECT_ROOT)))
+    return copied
 
 
 # --------------------------------------------------------------------------- #

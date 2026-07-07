@@ -33,5 +33,8 @@ blueprint-verso/_out
 
 __pycache__
 
+## Heartbeat profiler sibling temp files (injected copies; never real source)
+*.hbtmp.lean
+
 ## Per-session workflow scratch cache (disposed at session end)
 /.cache/
