@@ -1,39 +1,44 @@
 #!/usr/bin/env python3
 """
-Zero-dependency stdio MCP server exposing the FLT per-file profile ranker.
+Zero-dependency stdio MCP server that times the *build* of every FLT module in
+the import closure and writes the raw timing data to a new file.
 
 Speaks JSON-RPC 2.0 over newline-delimited stdio (MCP stdio transport), so it
 needs no third-party packages -- only the Python standard library.
 
+How this differs from `flt_profile_ranking`:
+    `flt_profile_ranking` runs `lean --profile` and derives a per-declaration
+    OWN time (total minus import time, divided by #decls). This tool is simpler
+    and coarser: it times the full wall-clock cost of compiling each file --
+    imports included -- as a stand-in for "how long does this file take to
+    build". No profiling, no per-decl accounting.
+
 Exposed tool:
-    flt_profile_ranking(closure_json?, modules?, timeout?, limit?, write_output?)
+    flt_build_timing(closure_json?, modules?, timeout?, runs?, limit?, write_output?)
         For every FLT module listed in .cache/flt_import_closure_output.json
         (the output of the `flt_import_closure` tool), run
 
-            time lake env lean --profile <file>
+            lake env lean <leanOptions> <file>
 
-        capture its `--profile` output, compute
-        (total wall time) - (import time), i.e. the time Lean spent on the
-        file's OWN content after its imports finished loading, then divide that
-        by the number of top-level declarations in the file and rank the modules
-        by this per-declaration own time. The wall time is the `real` figure
-        `time` would report; it is measured in-process for portability (Windows
-        has no `time` builtin), which is exactly equivalent. Declarations are
-        counted by scanning the `.lean` source for declaration keywords.
+        and measure the wall-clock time Lean takes to compile that single file
+        (its imports must already be built, e.g. via `lake exe cache get`). The
+        file is compiled `runs` times (default 3) and the wall times are averaged
+        to reduce noise; per-run figures are retained. Modules are ranked slowest
+        build first, and the full result is written to .cache/flt_build_times.json.
 
-        Because wall time is noisy, each file is profiled `runs` times
-        (default 3) and the total/import timings are averaged before the
-        per-declaration own time is derived. `runs` is caller-configurable.
+        `lake env lean <file>` recompiles the file's own content on every
+        invocation (it does not consult lake's up-to-date olean cache), so the
+        measurement is repeatable and does not require invalidating the build
+        tree between runs.
 
 Run standalone for a quick protocol smoke test:
-    echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | tools/flt_profile_ranking.py
+    echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | tools/flt_build_timing.py
 
-Or run the ranking directly (bypassing MCP), e.g. on the first 3 modules:
-    tools/flt_profile_ranking.py --run --limit 3
+Or run the timing directly (bypassing MCP), e.g. on the first 3 modules:
+    tools/flt_build_timing.py --run --limit 3
 """
 
 import json
-import re
 import subprocess
 import sys
 import time
@@ -46,26 +51,25 @@ _PROJECT_ROOT = _HERE.parent
 _LAKEFILE = _PROJECT_ROOT / "lakefile.toml"
 _CACHE_DIR = _PROJECT_ROOT / ".cache"
 DEFAULT_CLOSURE_JSON = _CACHE_DIR / "flt_import_closure_output.json"
-DEFAULT_OUTPUT = _CACHE_DIR / "flt_profile_ranking.json"
+DEFAULT_OUTPUT = _CACHE_DIR / "flt_build_times.json"
 DEFAULT_TIMEOUT = 900  # seconds per file
-DEFAULT_RUNS = 3  # profile each file this many times and average the timings
+DEFAULT_RUNS = 3  # build each file this many times and average the wall times
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "flt-profile-ranking", "version": "1.0.0"}
+SERVER_INFO = {"name": "flt-build-timing", "version": "1.0.0"}
 
 TOOLS = [
     {
-        "name": "flt_profile_ranking",
+        "name": "flt_build_timing",
         "description": (
-            "Run `time lake env lean --profile <file>` on every FLT module in "
-            ".cache/flt_import_closure_output.json and return a ranked list of "
-            "(total wall time - import time) / (number of declarations) per file "
-            "-- i.e. the time Lean spent elaborating the file's OWN content (with "
-            "the cost of loading its imports subtracted out), divided by the "
-            "number of top-level declarations in the file. Slowest per-declaration "
-            "own-time first. Each file is profiled `runs` times (default 3) and "
-            "the timings are averaged to reduce wall-clock noise. Results are "
-            "also written to .cache/flt_profile_ranking.json. NOTE: requires the "
+            "Time the full build of every FLT module in "
+            ".cache/flt_import_closure_output.json by running "
+            "`lake env lean <file>` and measuring its wall-clock compile time "
+            "(imports included). Ranks modules slowest build first and writes "
+            "the raw timing data to .cache/flt_build_times.json. Each file is "
+            "built `runs` times (default 3) and the wall times averaged to reduce "
+            "noise. Coarser than `flt_profile_ranking` (which derives a per-decl "
+            "own time); use this for whole-file build cost. NOTE: requires the "
             "Mathlib/FLT oleans to be built (e.g. `lake exe cache get`), else "
             "every file errors at the import stage."
         ),
@@ -84,7 +88,7 @@ TOOLS = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "Explicit list of FLT modules to profile, overriding "
+                        "Explicit list of FLT modules to time, overriding "
                         "closure_json (e.g. [\"FLT.NumberField.AdeleRing\"])."
                     ),
                 },
@@ -98,20 +102,19 @@ TOOLS = [
                 "runs": {
                     "type": "integer",
                     "description": (
-                        f"How many times to profile each file, averaging the "
-                        f"timings to reduce wall-clock noise (default: {DEFAULT_RUNS}, "
-                        "minimum 1)."
+                        f"How many times to build each file, averaging the wall "
+                        f"times to reduce noise (default: {DEFAULT_RUNS}, minimum 1)."
                     ),
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Only profile the first N modules (useful for a smoke test).",
+                    "description": "Only time the first N modules (useful for a smoke test).",
                 },
                 "write_output": {
                     "type": "boolean",
                     "description": (
                         "Also write the ranked result to "
-                        ".cache/flt_profile_ranking.json (default true)."
+                        ".cache/flt_build_times.json (default true)."
                     ),
                 },
             },
@@ -142,9 +145,9 @@ def _lean_option_args() -> list[str]:
     `lake env lean` sets up the environment (LEAN_PATH etc.) but, unlike
     `lake build`, does NOT apply the package's Lean options -- so a file that
     builds cleanly can otherwise diverge (different typeclass search, autoImplicit
-    behaviour, heartbeat outcomes) when profiled. Passing them here makes the
-    profiler elaborate each file exactly as the build does. Keys are kept verbatim,
-    including any `weak.` prefix, which Lean treats as "ignore if unknown"."""
+    behaviour, heartbeat outcomes) when compiled directly. Passing them here makes
+    the timing match the real build. Keys are kept verbatim, including any `weak.`
+    prefix, which Lean treats as "ignore if unknown"."""
     global _lean_option_args_cache
     if _lean_option_args_cache is not None:
         return _lean_option_args_cache
@@ -172,96 +175,10 @@ def _flatten_options(options: dict, prefix: str = ""):
             yield dotted, value
 
 
-# Leading declaration keywords, optionally preceded by attributes/modifiers.
-_DECL_KEYWORDS = (
-    "theorem", "lemma", "def", "abbrev", "instance", "structure",
-    "inductive", "class", "axiom", "opaque", "example",
-)
-_DECL_MODIFIERS = (
-    "private", "protected", "noncomputable", "partial", "unsafe",
-    "scoped", "local", "mutual",
-)
-_DECL_RE = re.compile(
-    r"^[ \t]*"                                      # leading indentation
-    r"(?:@\[[^\]]*\][ \t]*)*"                        # optional @[...] attributes
-    r"(?:(?:" + "|".join(_DECL_MODIFIERS) + r")[ \t]+)*"  # optional modifiers
-    r"(?:" + "|".join(_DECL_KEYWORDS) + r")\b",      # the declaration keyword
-    re.MULTILINE,
-)
-
-
-def _strip_comments(src: str) -> str:
-    """Remove Lean line (`--`) and block (`/- -/`) comments so keywords inside
-    comments/docstrings aren't miscounted. A best-effort heuristic (nested block
-    comments and `--` inside string literals are not handled precisely)."""
-    src = re.sub(r"/-.*?-/", " ", src, flags=re.DOTALL)  # block comments & docstrings
-    src = re.sub(r"--[^\n]*", " ", src)                    # line comments
-    return src
-
-
-def _count_declarations(path: Path) -> int | None:
-    """Count top-level declarations in a `.lean` source file by scanning for
-    declaration keywords at the start of a line (after attributes/modifiers)."""
-    try:
-        src = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    return len(_DECL_RE.findall(_strip_comments(src)))
-
-
-def _parse_duration(text: str) -> float | None:
-    """Parse a Lean profiler duration like '1.83s', '218ms', '1m2.3s' to seconds."""
-    text = text.strip()
-    total = 0.0
-    matched = False
-    # Minutes component, e.g. the '1m' in '1m2.3s'.
-    m = re.search(r"([\d.]+)\s*m(?![s])", text)
-    if m:
-        total += float(m.group(1)) * 60.0
-        matched = True
-    # Milliseconds.
-    m = re.search(r"([\d.]+)\s*ms", text)
-    if m:
-        total += float(m.group(1)) / 1000.0
-        matched = True
-    # Seconds. A '...ms' token can't match here (its digits are followed by 'm',
-    # not 's'), so milliseconds are never double-counted.
-    for sm in re.finditer(r"([\d.]+)\s*s\b", text):
-        total += float(sm.group(1))
-        matched = True
-    return total if matched else None
-
-
-def _parse_import_seconds(output: str) -> float | None:
-    """Extract the import time (seconds) from `lean --profile` output.
-
-    Prefers the `import` entry inside the `cumulative profiling times:` block;
-    falls back to a top-level `import took <dur>` line.
-    """
-    lines = output.splitlines()
-    in_block = False
-    for line in lines:
-        if "cumulative profiling times:" in line:
-            in_block = True
-            continue
-        if in_block:
-            stripped = line.strip()
-            if stripped.startswith("import"):
-                return _parse_duration(stripped[len("import"):])
-            # Block entries are indented; a non-indented line ends the block.
-            if stripped and not line[:1].isspace():
-                in_block = False
-    # Fallback: the top-of-output "import took 1.83s" line.
-    m = re.search(r"import took\s+(.+)", output)
-    if m:
-        return _parse_duration(m.group(1))
-    return None
-
-
 def _measure_once(cmd: list[str], timeout: float) -> dict:
-    """Run one `lake env lean --profile` invocation; return {total_s, import_s,
-    error}. `total_s` is the wall time; `import_s` the parsed import time (or
-    None); `error` is the first error line / timeout message, else None."""
+    """Run one `lake env lean <file>` build; return {total_s, error}. `total_s`
+    is the wall time; `error` is the first error line / timeout message, else
+    None."""
     start = time.monotonic()
     try:
         proc = subprocess.run(
@@ -269,9 +186,8 @@ def _measure_once(cmd: list[str], timeout: float) -> dict:
             cwd=str(_PROJECT_ROOT),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            # Lean emits UTF-8; decode as such (with replacement) so the reader
-            # thread doesn't crash on non-cp1252 bytes under Windows' default
-            # locale encoding.
+            # Lean emits UTF-8; decode as such (with replacement) so we don't
+            # crash on non-cp1252 bytes under Windows' default locale encoding.
             encoding="utf-8",
             errors="replace",
             text=True,
@@ -281,39 +197,31 @@ def _measure_once(cmd: list[str], timeout: float) -> dict:
         output = proc.stdout or ""
         error = None
         if proc.returncode != 0:
-            # Surface the first error line for context (imports still get timed).
             error = next(
                 (ln for ln in output.splitlines() if ": error:" in ln),
                 f"lean exited with code {proc.returncode}",
             ).strip()
-        return {
-            "total_s": round(elapsed, 3),
-            "import_s": _parse_import_seconds(output),
-            "error": error,
-        }
+        return {"total_s": round(elapsed, 3), "error": error}
     except subprocess.TimeoutExpired:
         return {
             "total_s": round(time.monotonic() - start, 3),
-            "import_s": None,
             "error": f"timed out after {timeout}s",
         }
     except Exception as e:  # noqa: BLE001 - surface any failure into the record
-        return {"total_s": None, "import_s": None, "error": f"{type(e).__name__}: {e}"}
+        return {"total_s": None, "error": f"{type(e).__name__}: {e}"}
 
 
-def _profile_one(module: str, timeout: float, runs: int = DEFAULT_RUNS) -> dict:
-    """Run `lake env lean --profile` on one module `runs` times and average the
-    total/import timings; return a timing record."""
+def _time_one(module: str, timeout: float, runs: int = DEFAULT_RUNS) -> dict:
+    """Build one module `runs` times and average the wall times; return a
+    timing record."""
     runs = max(1, runs)
     path = _module_to_path(module)
     record = {
         "module": module,
-        "file": str(path.relative_to(_PROJECT_ROOT)).replace("\\", "/"),
+        "file": str(path.relative_to(_PROJECT_ROOT)).replace("\\", "/")
+        if path.is_file()
+        else module.replace(".", "/") + ".lean",
         "total_s": None,
-        "import_s": None,
-        "own_s": None,
-        "decl_count": None,
-        "own_s_per_decl": None,
         "runs": runs,
         "runs_completed": 0,
         "total_s_runs": [],
@@ -322,11 +230,9 @@ def _profile_one(module: str, timeout: float, runs: int = DEFAULT_RUNS) -> dict:
     if not path.is_file():
         record["error"] = "file not found"
         return record
-    record["decl_count"] = _count_declarations(path)
 
-    cmd = ["lake", "env", "lean", *_lean_option_args(), "--profile", str(path)]
+    cmd = ["lake", "env", "lean", *_lean_option_args(), str(path)]
     totals: list[float] = []
-    imports: list[float] = []
     for _ in range(runs):
         m = _measure_once(cmd, timeout)
         if m["total_s"] is not None:
@@ -339,20 +245,10 @@ def _profile_one(module: str, timeout: float, runs: int = DEFAULT_RUNS) -> dict:
                 record["total_s"] = m["total_s"]
             break
         totals.append(m["total_s"])
-        if m["import_s"] is not None:
-            imports.append(m["import_s"])
 
     record["runs_completed"] = len(totals)
     if totals:
-        avg_total = sum(totals) / len(totals)
-        record["total_s"] = round(avg_total, 3)
-        if imports:
-            avg_import = sum(imports) / len(imports)
-            record["import_s"] = round(avg_import, 3)
-            own_s = round(max(avg_total - avg_import, 0.0), 3)
-            record["own_s"] = own_s
-            if record["decl_count"]:  # non-None and > 0
-                record["own_s_per_decl"] = round(own_s / record["decl_count"], 6)
+        record["total_s"] = round(sum(totals) / len(totals), 3)
     return record
 
 
@@ -365,43 +261,34 @@ def _load_modules(closure_json: Path) -> list[str]:
 
 
 def _rank_key(r: dict):
-    """Sort key: slowest own-time-per-declaration first, missing values last."""
-    return (r["own_s_per_decl"] is None, -(r["own_s_per_decl"] or 0.0))
+    """Sort key: slowest total build time first, missing values last."""
+    return (r["total_s"] is None, -(r["total_s"] or 0.0))
 
 
-def _render(records: list[dict], skipped_no_import: int, runs: int) -> str:
-    """Render the ranked records as a plain-text table (slowest per-decl first)."""
+def _render(records: list[dict], runs: int) -> str:
+    """Render the ranked records as a plain-text table (slowest build first)."""
     ranked = sorted(records, key=_rank_key)
+    errored = sum(1 for r in records if r["error"])
     lines = [
-        "Ranked by own elaboration time per declaration "
-        "((total wall time - import time) / #declarations), slowest first.",
-        f"Each file profiled {runs} time(s); total/import timings averaged.",
+        "Ranked by whole-file build wall time (`lake env lean <file>`), slowest first.",
+        f"Each file built {runs} time(s); total_s is the average over runs_completed.",
         "",
-        f"{'rank':>4}  {'s/decl':>10}  {'own_s':>8}  {'decls':>6}  "
-        f"{'total_s':>8}  {'import_s':>8}  module",
-        f"{'':->4}  {'':->10}  {'':->8}  {'':->6}  {'':->8}  {'':->8}  {'':->40}",
+        f"{'rank':>4}  {'total_s':>8}  {'runs':>4}  module",
+        f"{'':->4}  {'':->8}  {'':->4}  {'':->40}",
     ]
     for i, r in enumerate(ranked, 1):
-        per = f"{r['own_s_per_decl']:.6f}" if r["own_s_per_decl"] is not None else "-"
-        own = f"{r['own_s']:.3f}" if r["own_s"] is not None else "-"
-        decls = f"{r['decl_count']}" if r["decl_count"] is not None else "-"
         total = f"{r['total_s']:.3f}" if r["total_s"] is not None else "-"
-        imp = f"{r['import_s']:.3f}" if r["import_s"] is not None else "-"
         flag = f"  [ERROR: {r['error']}]" if r["error"] else ""
         lines.append(
-            f"{i:>4}  {per:>10}  {own:>8}  {decls:>6}  "
-            f"{total:>8}  {imp:>8}  {r['module']}{flag}"
+            f"{i:>4}  {total:>8}  {r['runs_completed']:>4}  {r['module']}{flag}"
         )
-    if skipped_no_import:
+    if errored:
         lines.append("")
-        lines.append(
-            f"Note: {skipped_no_import} file(s) had no per-declaration own time "
-            "(sorted last); missing import time or zero declarations."
-        )
+        lines.append(f"Note: {errored} file(s) errored during build (see flags above).")
     return "\n".join(lines)
 
 
-def _run_ranking(
+def _run_timing(
     closure_json: Path | None,
     modules: list[str] | None,
     timeout: float,
@@ -418,25 +305,21 @@ def _run_ranking(
     if limit is not None:
         modules = modules[:limit]
 
-    records = [_profile_one(m, timeout, runs) for m in modules]
+    records = [_time_one(m, timeout, runs) for m in modules]
     ranked = sorted(records, key=_rank_key)
-    skipped_no_import = sum(1 for r in records if r["own_s_per_decl"] is None)
-    text = _render(records, skipped_no_import, runs)
+    text = _render(records, runs)
 
     if write_output:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
         DEFAULT_OUTPUT.write_text(
             json.dumps(
                 {
-                    "command": "time lake env lean --profile <file>",
-                    "metric": (
-                        "own_s_per_decl = (total_s - import_s) / decl_count "
-                        "(own elaboration wall time per top-level declaration)"
-                    ),
+                    "command": "lake env lean <file>",
+                    "metric": "total_s = whole-file build wall time (imports included)",
                     "runs": runs,
                     "note": (
-                        f"Each file profiled {runs} time(s); total_s/import_s are "
-                        "averages over runs_completed (per-run totals in total_s_runs)."
+                        f"Each file built {runs} time(s); total_s is the average "
+                        "over runs_completed (per-run wall times in total_s_runs)."
                     ),
                     "count": len(records),
                     "ranking": ranked,
@@ -472,11 +355,11 @@ def _handle(msg: dict) -> dict | None:
         params = msg.get("params") or {}
         name = params.get("name")
         args = params.get("arguments") or {}
-        if name != "flt_profile_ranking":
+        if name != "flt_build_timing":
             return _err(msg_id, -32602, f"Unknown tool: {name}")
         try:
             cj = args.get("closure_json")
-            text = _run_ranking(
+            text = _run_timing(
                 closure_json=Path(cj) if cj else None,
                 modules=args.get("modules") or None,
                 timeout=float(args.get("timeout", DEFAULT_TIMEOUT)),
@@ -504,7 +387,7 @@ def _err(msg_id, code, message):
 
 def _cli() -> int:
     """Direct (non-MCP) run:
-    `flt_profile_ranking.py --run [--limit N] [--timeout S] [--runs N]`."""
+    `flt_build_timing.py --run [--limit N] [--timeout S] [--runs N]`."""
     argv = sys.argv[1:]
     limit = None
     timeout = DEFAULT_TIMEOUT
@@ -515,7 +398,7 @@ def _cli() -> int:
         timeout = float(argv[argv.index("--timeout") + 1])
     if "--runs" in argv:
         runs = int(argv[argv.index("--runs") + 1])
-    print(_run_ranking(None, None, timeout, limit, write_output=True, runs=runs))
+    print(_run_timing(None, None, timeout, limit, write_output=True, runs=runs))
     return 0
 
 
