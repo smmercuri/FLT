@@ -44,9 +44,9 @@ _TRACE_SUBDIR = "isdefeq"
 _LEGACY_TRACE = _CACHE_DIR / "isdefeq_raw.txt"
 
 
-def _trace_dir(pass_no=None):
-    """`.cache/Pass_<n>/isdefeq`, created."""
-    return cache_paths.pass_subdir(_TRACE_SUBDIR, pass_no)
+def _trace_dir(pass_no=None, stage=cache_paths.DEFAULT_STAGE):
+    """`.cache/Pass_<n>/<stage>/isdefeq`, created."""
+    return cache_paths.pass_subdir(_TRACE_SUBDIR, pass_no, stage)
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "isdefeq-trace", "version": "1.0.0"}
@@ -85,8 +85,19 @@ TOOLS = [
                     "type": "integer",
                     "description": (
                         "Pass number: dumps/reports live under "
-                        ".cache/Pass_<n>/isdefeq/. Also updates .cache/current_pass. "
-                        "Defaults to the current pass pointer (or 1 if unset)."
+                        ".cache/Pass_<n>/<stage>/isdefeq/. Also updates "
+                        ".cache/current_pass. Defaults to the current pass pointer "
+                        "(or 1 if unset)."
+                    ),
+                },
+                "stage": {
+                    "type": "string",
+                    "enum": ["before", "after"],
+                    "description": (
+                        "Within-pass bucket: 'before' (default) = baseline, 'after' "
+                        "= post-fix. Must match the stage the dump was captured "
+                        "under, since the report is read back from "
+                        ".cache/Pass_<n>/<stage>/isdefeq/."
                     ),
                 },
             },
@@ -136,8 +147,18 @@ TOOLS = [
                     "type": "integer",
                     "description": (
                         "Pass number: dump + report go under "
-                        ".cache/Pass_<n>/isdefeq/. Also updates .cache/current_pass. "
-                        "Defaults to the current pass pointer (or 1 if unset)."
+                        ".cache/Pass_<n>/<stage>/isdefeq/. Also updates "
+                        ".cache/current_pass. Defaults to the current pass pointer "
+                        "(or 1 if unset)."
+                    ),
+                },
+                "stage": {
+                    "type": "string",
+                    "enum": ["before", "after"],
+                    "description": (
+                        "Within-pass bucket: 'before' (default) = baseline "
+                        "diagnosis, 'after' = post-fix. Writes to "
+                        ".cache/Pass_<n>/<stage>/isdefeq/."
                     ),
                 },
             },
@@ -381,24 +402,25 @@ def _slugify(s: str) -> str:
     return _SLUG.sub("_", s.strip()).strip("_") or "isdefeq"
 
 
-def _resolve_input(label, path, pass_no=None):
+def _resolve_input(label, path, pass_no=None, stage=cache_paths.DEFAULT_STAGE):
     if path:
         p = Path(path)
         return p if p.is_absolute() else _PROJECT_ROOT / p
     if label:
-        return _trace_dir(pass_no) / f"{_slugify(label)}.raw.txt"
+        return _trace_dir(pass_no, stage) / f"{_slugify(label)}.raw.txt"
     return _LEGACY_TRACE
 
 
-def _run(label, path, top, write_output, pass_no=None):
-    p = _resolve_input(label, path, pass_no)
+def _run(label, path, top, write_output, pass_no=None,
+         stage=cache_paths.DEFAULT_STAGE):
+    p = _resolve_input(label, path, pass_no, stage)
     if not p.is_file():
         return f"error: trace file not found: {p}"
     report = analyze(p.read_text(errors="replace"), top=top)
     if not write_output:
         return report
     slug = _slugify(label) if label else _slugify(p.stem.replace(".raw", ""))
-    report_path = _trace_dir(pass_no) / f"{slug}.report.txt"
+    report_path = _trace_dir(pass_no, stage) / f"{slug}.report.txt"
     report_path.write_text(report + "\n")
     return f"{report}\n\n(written to {report_path.relative_to(_PROJECT_ROOT)})"
 
@@ -433,7 +455,8 @@ def _block_start(lines, idx):
     return i
 
 
-def capture(file, decl, line, pp_all, top, write_output, pass_no=None):
+def capture(file, decl, line, pp_all, top, write_output, pass_no=None,
+            stage=cache_paths.DEFAULT_STAGE):
     src = Path(file)
     if not src.is_absolute():
         src = _PROJECT_ROOT / src
@@ -458,7 +481,7 @@ def capture(file, decl, line, pp_all, top, write_output, pass_no=None):
     ins = _block_start(lines, decl_idx)
     label = decl or f"{src.stem}_L{line}"
     slug = _slugify(label)
-    trace_dir = _trace_dir(pass_no)
+    trace_dir = _trace_dir(pass_no, stage)
     raw_path = trace_dir / f"{slug}.raw.txt"
 
     inject = ([_PPALL_LINE] if pp_all else []) + [_OPTION_LINE]
@@ -525,6 +548,7 @@ def _handle(msg):
                     top=int(args.get("top", 15)),
                     write_output=bool(args.get("write_output", True)),
                     pass_no=args.get("pass"),
+                    stage=args.get("stage", cache_paths.DEFAULT_STAGE),
                 )
             elif name == "capture_isdefeq_trace":
                 text = capture(
@@ -535,6 +559,7 @@ def _handle(msg):
                     top=int(args.get("top", 15)),
                     write_output=bool(args.get("write_output", True)),
                     pass_no=args.get("pass"),
+                    stage=args.get("stage", cache_paths.DEFAULT_STAGE),
                 )
             else:
                 return _err(msg_id, -32602, f"Unknown tool: {name}")

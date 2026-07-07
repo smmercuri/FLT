@@ -44,9 +44,9 @@ _TRACE_SUBDIR = "synth_trace"
 _LEGACY_TRACE = _CACHE_DIR / "synth_trace_raw.txt"
 
 
-def _trace_dir(pass_no=None):
-    """`.cache/Pass_<n>/synth_trace`, created."""
-    return cache_paths.pass_subdir(_TRACE_SUBDIR, pass_no)
+def _trace_dir(pass_no=None, stage=cache_paths.DEFAULT_STAGE):
+    """`.cache/Pass_<n>/<stage>/synth_trace`, created."""
+    return cache_paths.pass_subdir(_TRACE_SUBDIR, pass_no, stage)
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "synth-trace", "version": "1.0.0"}
@@ -97,9 +97,19 @@ TOOLS = [
                     "type": "integer",
                     "description": (
                         "Pass number: dumps/reports live under "
-                        ".cache/Pass_<n>/synth_trace/. Also updates "
+                        ".cache/Pass_<n>/<stage>/synth_trace/. Also updates "
                         ".cache/current_pass. Defaults to the current pass pointer "
                         "(or 1 if unset)."
+                    ),
+                },
+                "stage": {
+                    "type": "string",
+                    "enum": ["before", "after"],
+                    "description": (
+                        "Within-pass bucket: 'before' (default) = baseline, 'after' "
+                        "= post-fix. Must match the stage the dump was captured "
+                        "under, since the report is read back from "
+                        ".cache/Pass_<n>/<stage>/synth_trace/."
                     ),
                 },
             },
@@ -148,9 +158,18 @@ TOOLS = [
                     "type": "integer",
                     "description": (
                         "Pass number: dump + report go under "
-                        ".cache/Pass_<n>/synth_trace/. Also updates "
+                        ".cache/Pass_<n>/<stage>/synth_trace/. Also updates "
                         ".cache/current_pass. Defaults to the current pass pointer "
                         "(or 1 if unset)."
+                    ),
+                },
+                "stage": {
+                    "type": "string",
+                    "enum": ["before", "after"],
+                    "description": (
+                        "Within-pass bucket: 'before' (default) = baseline "
+                        "diagnosis, 'after' = post-fix. Writes to "
+                        ".cache/Pass_<n>/<stage>/synth_trace/."
                     ),
                 },
             },
@@ -401,20 +420,22 @@ def _slugify(s: str) -> str:
     return _SLUG.sub("_", s.strip()).strip("_") or "synth_trace"
 
 
-def _resolve_input(label: str | None, path: str | None, pass_no=None) -> Path:
+def _resolve_input(label: str | None, path: str | None, pass_no=None,
+                   stage=cache_paths.DEFAULT_STAGE) -> Path:
     """Locate the raw dump: explicit `path` wins, else
-    `.cache/Pass_<n>/synth_trace/<label>.raw.txt`, else the legacy flat location."""
+    `.cache/Pass_<n>/<stage>/synth_trace/<label>.raw.txt`, else the legacy
+    flat location."""
     if path:
         p = Path(path)
         return p if p.is_absolute() else _PROJECT_ROOT / p
     if label:
-        return _trace_dir(pass_no) / f"{_slugify(label)}.raw.txt"
+        return _trace_dir(pass_no, stage) / f"{_slugify(label)}.raw.txt"
     return _LEGACY_TRACE
 
 
 def _run(label: str | None, path: str | None, top: int, write_output: bool,
-         pass_no=None) -> str:
-    p = _resolve_input(label, path, pass_no)
+         pass_no=None, stage=cache_paths.DEFAULT_STAGE) -> str:
+    p = _resolve_input(label, path, pass_no, stage)
     if not p.is_file():
         return f"error: trace file not found: {p}"
     report = analyze(p.read_text(errors="replace"), top=top)
@@ -422,7 +443,7 @@ def _run(label: str | None, path: str | None, top: int, write_output: bool,
         return report
     # Name the report after the label, or fall back to the input file's stem.
     slug = _slugify(label) if label else _slugify(p.stem.replace(".raw", ""))
-    report_path = _trace_dir(pass_no) / f"{slug}.report.txt"
+    report_path = _trace_dir(pass_no, stage) / f"{slug}.report.txt"
     report_path.write_text(report + "\n")
     return f"{report}\n\n(written to {report_path.relative_to(_PROJECT_ROOT)})"
 
@@ -461,7 +482,8 @@ def _block_start(lines: list[str], idx: int) -> int:
 
 
 def capture(file: str, decl: str | None, line: int | None,
-            top: int, write_output: bool, pass_no=None) -> str:
+            top: int, write_output: bool, pass_no=None,
+            stage=cache_paths.DEFAULT_STAGE) -> str:
     src = Path(file)
     if not src.is_absolute():
         src = _PROJECT_ROOT / src
@@ -486,7 +508,7 @@ def capture(file: str, decl: str | None, line: int | None,
     ins = _block_start(lines, decl_idx)
     label = decl or f"{src.stem}_L{line}"
     slug = _slugify(label)
-    trace_dir = _trace_dir(pass_no)
+    trace_dir = _trace_dir(pass_no, stage)
     raw_path = trace_dir / f"{slug}.raw.txt"
 
     rel = src.relative_to(_PROJECT_ROOT) if src.is_relative_to(_PROJECT_ROOT) else src
@@ -553,6 +575,7 @@ def _handle(msg: dict) -> dict | None:
                     top=int(args.get("top", 15)),
                     write_output=bool(args.get("write_output", True)),
                     pass_no=args.get("pass"),
+                    stage=args.get("stage", cache_paths.DEFAULT_STAGE),
                 )
             elif name == "capture_synth_trace":
                 text = capture(
@@ -562,6 +585,7 @@ def _handle(msg: dict) -> dict | None:
                     top=int(args.get("top", 15)),
                     write_output=bool(args.get("write_output", True)),
                     pass_no=args.get("pass"),
+                    stage=args.get("stage", cache_paths.DEFAULT_STAGE),
                 )
             else:
                 return _err(msg_id, -32602, f"Unknown tool: {name}")

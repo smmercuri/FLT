@@ -22,6 +22,10 @@ Exposed tool:
         has no `time` builtin), which is exactly equivalent. Declarations are
         counted by scanning the `.lean` source for declaration keywords.
 
+        Because wall time is noisy, each file is profiled `runs` times
+        (default 3) and the total/import timings are averaged before the
+        per-declaration own time is derived. `runs` is caller-configurable.
+
 Run standalone for a quick protocol smoke test:
     echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | tools/flt_profile_ranking.py
 
@@ -47,6 +51,7 @@ _CACHE_DIR = _PROJECT_ROOT / ".cache"
 DEFAULT_CLOSURE_JSON = _CACHE_DIR / "flt_import_closure_output.json"
 OUTPUT_NAME = "flt_profile_ranking.json"  # written under .cache/Pass_<n>/
 DEFAULT_TIMEOUT = 900  # seconds per file
+DEFAULT_RUNS = 3  # profile each file this many times and average the timings
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "flt-profile-ranking", "version": "1.0.0"}
@@ -60,12 +65,15 @@ TOOLS = [
             "time - import time) per file -- the total time Lean spent elaborating "
             "the file's OWN content, with imports subtracted out -- and the "
             "per-declaration figure own_s_per_decl = own_s / #declarations. Both "
-            "are reported for every module. The `rank_by` argument chooses the sort "
-            "key: `own_s` (default) surfaces the most expensive files overall "
+            "are reported for every module. Each file is profiled `runs` times "
+            "(default 3) and the total/import timings are averaged to reduce "
+            "wall-clock noise. The `rank_by` argument chooses the sort key: "
+            "`own_s` (default) surfaces the most expensive files overall "
             "(typically nearer the root of the import graph); `s/decl` surfaces "
             "files with a pathologically slow individual declaration (typically "
             "leaf nodes, where a fix propagates upward). Results are also written "
-            "to .cache/Pass_<n>/flt_profile_ranking.json (see the `pass` argument). "
+            "to .cache/Pass_<n>/<stage>/flt_profile_ranking.json (see the `pass` "
+            "and `stage` arguments). "
             "NOTE: requires the Mathlib/FLT oleans to be built (e.g. `lake exe "
             "cache get`), else every file errors at the import stage."
         ),
@@ -75,10 +83,21 @@ TOOLS = [
                 "pass": {
                     "type": "integer",
                     "description": (
-                        "Pass number: results are written under .cache/Pass_<n>/. "
-                        "Passing it also updates .cache/current_pass so the other "
-                        "tools in this pass write to the same place. Defaults to the "
-                        "current pass pointer (or 1 if unset)."
+                        "Pass number: results are written under "
+                        ".cache/Pass_<n>/<stage>/. Passing it also updates "
+                        ".cache/current_pass so the other tools in this pass write "
+                        "to the same place. Defaults to the current pass pointer "
+                        "(or 1 if unset)."
+                    ),
+                },
+                "stage": {
+                    "type": "string",
+                    "enum": ["before", "after"],
+                    "description": (
+                        "Within-pass bucket: 'before' (default) for the baseline "
+                        "diagnosis timing, 'after' for the post-fix re-timing. Writes "
+                        "to .cache/Pass_<n>/<stage>/ so before and after never "
+                        "overwrite each other and can be diffed."
                     ),
                 },
                 "rank_by": {
@@ -115,6 +134,14 @@ TOOLS = [
                         "A file that times out is recorded with its error flagged."
                     ),
                 },
+                "runs": {
+                    "type": "integer",
+                    "description": (
+                        f"How many times to profile each file, averaging the "
+                        f"timings to reduce wall-clock noise (default: {DEFAULT_RUNS}, "
+                        "minimum 1)."
+                    ),
+                },
                 "limit": {
                     "type": "integer",
                     "description": "Only profile the first N modules (useful for a smoke test).",
@@ -123,7 +150,7 @@ TOOLS = [
                     "type": "boolean",
                     "description": (
                         "Also write the ranked result to "
-                        ".cache/flt_profile_ranking.json (default true)."
+                        ".cache/Pass_<n>/<stage>/flt_profile_ranking.json (default true)."
                     ),
                 },
             },
@@ -270,25 +297,10 @@ def _parse_import_seconds(output: str) -> float | None:
     return None
 
 
-def _profile_one(module: str, timeout: float) -> dict:
-    """Run `lake env lean --profile` on one module; return a timing record."""
-    path = _module_to_path(module)
-    record = {
-        "module": module,
-        "file": str(path.relative_to(_PROJECT_ROOT)).replace("\\", "/"),
-        "total_s": None,
-        "import_s": None,
-        "own_s": None,
-        "decl_count": None,
-        "own_s_per_decl": None,
-        "error": None,
-    }
-    if not path.is_file():
-        record["error"] = "file not found"
-        return record
-    record["decl_count"] = _count_declarations(path)
-
-    cmd = ["lake", "env", "lean", *_lean_option_args(), "--profile", str(path)]
+def _measure_once(cmd: list[str], timeout: float) -> dict:
+    """Run one `lake env lean --profile` invocation; return {total_s, import_s,
+    error}. `total_s` is the wall time; `import_s` the parsed import time (or
+    None); `error` is the first error line / timeout message, else None."""
     start = time.monotonic()
     try:
         proc = subprocess.run(
@@ -306,26 +318,80 @@ def _profile_one(module: str, timeout: float) -> dict:
         )
         elapsed = time.monotonic() - start
         output = proc.stdout or ""
-        record["total_s"] = round(elapsed, 3)
-        import_s = _parse_import_seconds(output)
-        record["import_s"] = round(import_s, 3) if import_s is not None else None
-        if import_s is not None:
-            own_s = round(max(elapsed - import_s, 0.0), 3)
+        error = None
+        if proc.returncode != 0:
+            # Surface the first error line for context (imports still get timed).
+            error = next(
+                (ln for ln in output.splitlines() if ": error:" in ln),
+                f"lean exited with code {proc.returncode}",
+            ).strip()
+        return {
+            "total_s": round(elapsed, 3),
+            "import_s": _parse_import_seconds(output),
+            "error": error,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "total_s": round(time.monotonic() - start, 3),
+            "import_s": None,
+            "error": f"timed out after {timeout}s",
+        }
+    except Exception as e:  # noqa: BLE001 - surface any failure into the record
+        return {"total_s": None, "import_s": None, "error": f"{type(e).__name__}: {e}"}
+
+
+def _profile_one(module: str, timeout: float, runs: int = DEFAULT_RUNS) -> dict:
+    """Run `lake env lean --profile` on one module `runs` times and average the
+    total/import timings; return a timing record."""
+    runs = max(1, runs)
+    path = _module_to_path(module)
+    record = {
+        "module": module,
+        "file": str(path.relative_to(_PROJECT_ROOT)).replace("\\", "/"),
+        "total_s": None,
+        "import_s": None,
+        "own_s": None,
+        "decl_count": None,
+        "own_s_per_decl": None,
+        "runs": runs,
+        "runs_completed": 0,
+        "total_s_runs": [],
+        "error": None,
+    }
+    if not path.is_file():
+        record["error"] = "file not found"
+        return record
+    record["decl_count"] = _count_declarations(path)
+
+    cmd = ["lake", "env", "lean", *_lean_option_args(), "--profile", str(path)]
+    totals: list[float] = []
+    imports: list[float] = []
+    for _ in range(runs):
+        m = _measure_once(cmd, timeout)
+        if m["total_s"] is not None:
+            record["total_s_runs"].append(m["total_s"])
+        if m["error"]:
+            # A file that errors will almost certainly error on every run, so
+            # stop early and surface the first failure.
+            record["error"] = m["error"]
+            if m["total_s"] is not None and record["total_s"] is None:
+                record["total_s"] = m["total_s"]
+            break
+        totals.append(m["total_s"])
+        if m["import_s"] is not None:
+            imports.append(m["import_s"])
+
+    record["runs_completed"] = len(totals)
+    if totals:
+        avg_total = sum(totals) / len(totals)
+        record["total_s"] = round(avg_total, 3)
+        if imports:
+            avg_import = sum(imports) / len(imports)
+            record["import_s"] = round(avg_import, 3)
+            own_s = round(max(avg_total - avg_import, 0.0), 3)
             record["own_s"] = own_s
             if record["decl_count"]:  # non-None and > 0
                 record["own_s_per_decl"] = round(own_s / record["decl_count"], 6)
-        if proc.returncode != 0:
-            # Surface the first error line for context (imports still get timed).
-            err_line = next(
-                (ln for ln in output.splitlines() if ": error:" in ln),
-                f"lean exited with code {proc.returncode}",
-            )
-            record["error"] = err_line.strip()
-    except subprocess.TimeoutExpired:
-        record["total_s"] = round(time.monotonic() - start, 3)
-        record["error"] = f"timed out after {timeout}s"
-    except Exception as e:  # noqa: BLE001 - surface any failure into the record
-        record["error"] = f"{type(e).__name__}: {e}"
     return record
 
 
@@ -371,13 +437,15 @@ def _rank_key(r: dict, field: str):
     return (r[field] is None, -(r[field] or 0.0))
 
 
-def _render(records: list[dict], skipped_no_import: int, rank_field: str) -> str:
+def _render(records: list[dict], skipped_no_import: int, rank_field: str,
+            runs: int) -> str:
     """Render the ranked records as a plain-text table, sorted by `rank_field`
     (largest first). Both the `own_s` and `s/decl` columns are always shown; the
     header names whichever one is the active sort key."""
     ranked = sorted(records, key=lambda r: _rank_key(r, rank_field))
     lines = [
         f"Ranked by {_RANK_FIELD_TITLE[rank_field]}, slowest first.",
+        f"Each file profiled {runs} time(s); total/import timings averaged.",
         "",
         f"{'rank':>4}  {'own_s':>8}  {'s/decl':>10}  {'decls':>6}  "
         f"{'total_s':>8}  {'import_s':>8}  module",
@@ -416,8 +484,11 @@ def _run_ranking(
     write_output: bool,
     rank_by: str | None = None,
     pass_no=None,
+    runs: int = DEFAULT_RUNS,
+    stage=cache_paths.DEFAULT_STAGE,
 ) -> str:
     rank_field = _resolve_rank_field(rank_by)
+    runs = max(1, runs)
     if modules is None:
         cj = closure_json or DEFAULT_CLOSURE_JSON
         if not Path(cj).is_file():
@@ -426,18 +497,19 @@ def _run_ranking(
     if limit is not None:
         modules = modules[:limit]
 
-    records = [_profile_one(m, timeout) for m in modules]
+    records = [_profile_one(m, timeout, runs) for m in modules]
     ranked = sorted(records, key=lambda r: _rank_key(r, rank_field))
     skipped_no_import = sum(1 for r in records if r[rank_field] is None)
-    text = _render(records, skipped_no_import, rank_field)
+    text = _render(records, skipped_no_import, rank_field, runs)
 
     if write_output:
-        out_path = cache_paths.pass_dir(pass_no) / OUTPUT_NAME
+        out_path = cache_paths.pass_dir(pass_no, stage) / OUTPUT_NAME
         out_path.write_text(
             json.dumps(
                 {
                     "command": "time lake env lean --profile <file>",
                     "pass": cache_paths.resolve_pass(pass_no),
+                    "stage": cache_paths.resolve_stage(stage),
                     "rank_by": rank_field,
                     "metric": (
                         f"ranked by {rank_field}. own_s = total_s - import_s "
@@ -445,6 +517,11 @@ def _run_ranking(
                         "own_s_per_decl = own_s / decl_count (per-declaration "
                         "figure). Both are reported for every module regardless of "
                         "which one is the sort key."
+                    ),
+                    "runs": runs,
+                    "note": (
+                        f"Each file profiled {runs} time(s); total_s/import_s are "
+                        "averages over runs_completed (per-run totals in total_s_runs)."
                     ),
                     "count": len(records),
                     "ranking": ranked,
@@ -492,6 +569,8 @@ def _handle(msg: dict) -> dict | None:
                 write_output=bool(args.get("write_output", True)),
                 rank_by=args.get("rank_by"),
                 pass_no=args.get("pass"),
+                runs=int(args.get("runs", DEFAULT_RUNS)),
+                stage=args.get("stage", cache_paths.DEFAULT_STAGE),
             )
             return _ok(msg_id, {"content": [{"type": "text", "text": text}]})
         except Exception as e:  # noqa: BLE001 - surface any failure to the client
@@ -512,12 +591,15 @@ def _err(msg_id, code, message):
 
 
 def _cli() -> int:
-    """Direct (non-MCP) run: `flt_profile_ranking.py --run [--limit N] [--timeout S]`."""
+    """Direct (non-MCP) run:
+    `flt_profile_ranking.py --run [--limit N] [--timeout S] [--runs N]`."""
     argv = sys.argv[1:]
     limit = None
     timeout = DEFAULT_TIMEOUT
     rank_by = None
     pass_no = None
+    runs = DEFAULT_RUNS
+    stage = cache_paths.DEFAULT_STAGE
     if "--limit" in argv:
         limit = int(argv[argv.index("--limit") + 1])
     if "--timeout" in argv:
@@ -526,8 +608,12 @@ def _cli() -> int:
         rank_by = argv[argv.index("--rank-by") + 1]
     if "--pass" in argv:
         pass_no = int(argv[argv.index("--pass") + 1])
+    if "--runs" in argv:
+        runs = int(argv[argv.index("--runs") + 1])
+    if "--stage" in argv:
+        stage = argv[argv.index("--stage") + 1]
     print(_run_ranking(None, None, timeout, limit, write_output=True,
-                       rank_by=rank_by, pass_no=pass_no))
+                       rank_by=rank_by, pass_no=pass_no, runs=runs, stage=stage))
     return 0
 
 
