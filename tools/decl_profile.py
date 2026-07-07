@@ -22,9 +22,13 @@ Caveats:
     labelled by source line.
   * Order-based assignment assumes the file compiles (an errored decl emits no
     `Used` line and would shift the mapping) -- true for checked-in FLT files.
+  * Heartbeats are deterministic (they count work, not wall time), so the
+    `runs` option defaults to 1; setting it higher only acts as a consistency
+    check: the file is compiled `runs` times and each decl's heartbeat count is
+    averaged across them. Barring nondeterministic elaboration they agree exactly.
 
 Exposed tool:
-    profile_file(file, top?, write_output?)
+    profile_file(file, top?, write_output?, runs?)
 
 Run standalone for a quick protocol smoke test:
     echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | tools/decl_profile.py
@@ -45,6 +49,8 @@ _PROFILE_DIR = _CACHE_DIR / "decl_profile"
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "decl-profile", "version": "2.0.0"}
 
+DEFAULT_RUNS = 1  # heartbeats are deterministic; >1 only re-checks consistency
+
 TOOLS = [
     {
         "name": "profile_file",
@@ -52,9 +58,11 @@ TOOLS = [
             "Rank the declarations in a Lean file by heartbeat cost (deterministic) "
             "to find the worst offenders to trace next. Injects `#count_heartbeats in` "
             "above each top-level decl (exact decl<->cost assignment by construction), "
-            "compiles the file once, ALWAYS restores the source, and reports a ranked "
+            "compiles the file `runs` times (default 1), averages each decl's heartbeat "
+            "count across runs, ALWAYS restores the source, and reports a ranked "
             "per-decl profile. Heartbeats count elaborator work, not kernel reduction, "
-            "so `decide`-heavy decls read as cheap; `mutual` blocks count as one unit."
+            "so `decide`-heavy decls read as cheap; `mutual` blocks count as one unit. "
+            "Heartbeats are deterministic, so `runs` mainly serves as a consistency check."
         ),
         "inputSchema": {
             "type": "object",
@@ -66,6 +74,14 @@ TOOLS = [
                 "top": {
                     "type": "integer",
                     "description": "How many decls to show in the report (default 25; full list goes to JSON).",
+                },
+                "runs": {
+                    "type": "integer",
+                    "description": (
+                        "How many times to compile the file, averaging each decl's "
+                        "heartbeat count across runs (default 1, minimum 1). Heartbeats "
+                        "are deterministic, so raising this is mainly a consistency check."
+                    ),
                 },
                 "write_output": {
                     "type": "boolean",
@@ -197,7 +213,8 @@ def _build_report(module, ranked, top, note):
 # Core: parse decls -> inject markers -> compile -> restore -> zip -> rank
 # --------------------------------------------------------------------------- #
 
-def profile_file(file, top, write_output):
+def profile_file(file, top, write_output, runs=DEFAULT_RUNS):
+    runs = max(1, runs)
     src = Path(file)
     if not src.is_absolute():
         src = _PROJECT_ROOT / src
@@ -222,15 +239,21 @@ def profile_file(file, top, write_output):
         lines.insert(idx, text)
 
     rel = src.relative_to(_PROJECT_ROOT) if src.is_relative_to(_PROJECT_ROOT) else src
+    # Inject the markers once, then compile the file `runs` times, collecting the
+    # per-decl heartbeat vector each run. The source is ALWAYS restored.
+    runs_used = []  # list of per-run [heartbeats] vectors, in source order
     try:
         src.write_text("".join(lines))
-        proc = subprocess.run(
-            ["lake", "env", "lean", str(rel)],
-            cwd=str(_PROJECT_ROOT),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            timeout=_BUILD_TIMEOUT,
-        )
-        output = proc.stdout.decode("utf-8", "replace")
+        for _ in range(runs):
+            proc = subprocess.run(
+                ["lake", "env", "lean", str(rel)],
+                cwd=str(_PROJECT_ROOT),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                timeout=_BUILD_TIMEOUT,
+            )
+            output = proc.stdout.decode("utf-8", "replace")
+            runs_used.append([int(m.group(1)) for line in output.splitlines()
+                              if (m := _USED_RE.search(line))])
     except subprocess.TimeoutExpired:
         return f"error: `lake env lean {rel}` timed out after {_BUILD_TIMEOUT}s (file restored)."
     except Exception as e:  # noqa: BLE001
@@ -238,19 +261,25 @@ def profile_file(file, top, write_output):
     finally:
         src.write_text(original)
 
-    used = [int(m.group(1)) for line in output.splitlines()
-            if (m := _USED_RE.search(line))]
+    # Average each decl's heartbeats across runs. Runs can differ in length only
+    # if a decl errored (shifting the mapping), so align on the shortest run.
+    names = [name for name, _ in decls]
+    n_reports = min((len(u) for u in runs_used), default=0)
+    used = [round(sum(u[k] for u in runs_used) / len(runs_used))
+            for k in range(n_reports)]
 
     # Assign by source order: k-th `Used N` <-> k-th declaration.
-    names = [name for name, _ in decls]
     note = None
-    if len(used) != len(names):
-        note = (f"warning: injected {len(names)} markers but saw {len(used)} heartbeat "
+    if runs > 1:
+        note = f"averaged over {runs} run(s)."
+    if n_reports != len(names):
+        warn = (f"warning: injected {len(names)} markers but saw {n_reports} heartbeat "
                 f"reports -- a decl may have errored (assignment may be off past that "
-                f"point). Aligning the first {min(len(used), len(names))}.")
+                f"point). Aligning the first {min(n_reports, len(names))}.")
         errs = [l for l in output.splitlines() if "error" in l.lower()][:5]
         if errs:
-            note += "\n  first errors: " + " | ".join(errs)
+            warn += "\n  first errors: " + " | ".join(errs)
+        note = f"{note}\n{warn}" if note else warn
     pairs = list(zip(names, used))
     ranked = sorted(pairs, key=lambda kv: kv[1], reverse=True)
 
@@ -266,6 +295,7 @@ def profile_file(file, top, write_output):
     json_path.write_text(json.dumps({
         "module": module,
         "file": str(rel),
+        "runs": runs,
         "count": len(ranked),
         "total_heartbeats": sum(hb for _, hb in ranked),
         "ranking": [{"rank": i, "decl": n, "heartbeats": hb}
@@ -303,6 +333,7 @@ def _handle(msg):
                 file=args.get("file"),
                 top=int(args.get("top", 25)),
                 write_output=bool(args.get("write_output", True)),
+                runs=int(args.get("runs", DEFAULT_RUNS)),
             )
             return _ok(msg_id, {"content": [{"type": "text", "text": text}]})
         except Exception as e:  # noqa: BLE001
