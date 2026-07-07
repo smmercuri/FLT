@@ -35,6 +35,13 @@
           "tools/flt_build_timing.py"
       ]
     },
+    "flt-instruction-count": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+          "tools/flt_instruction_count.py"
+      ]
+    },
     "synth-trace": {
       "type": "stdio",
       "command": "python3",

@@ -23,5 +23,9 @@ theorem Basis.toMatrix_continuous {ι R M : Type*} [AddCommGroup M]
     [IsTopologicalAddGroup M] [ContinuousSMul R M] [CompleteSpace R] [T2Space M]
     [FiniteDimensional R M] (B : Module.Basis ι R M) :
     Continuous fun (v : ι → M) => B.toMatrix v :=
+  -- Pin the base `AddCommMonoid M`/`Semiring R` instances once so the downstream instance
+  -- requests reuse a single term instead of re-walking the algebra hierarchy each time.
+  letI : AddCommMonoid M := inferInstance
+  letI : Semiring R := inferInstance
   let := Fintype.ofFinite ι
   LinearMap.continuous_of_finiteDimensional B.toMatrixEquiv.toLinearMap

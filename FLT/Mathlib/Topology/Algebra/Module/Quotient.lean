@@ -40,17 +40,22 @@ def Submodule.quotientPiContinuousLinearEquiv {R ι : Type*} [CommRing R] {G : �
     [(i : ι) → AddCommGroup (G i)] [(i : ι) → Module R (G i)] [(i : ι) → TopologicalSpace (G i)]
     [(i : ι) → IsTopologicalAddGroup (G i)] [Fintype ι] [DecidableEq ι]
     (p : (i : ι) → Submodule R (G i)) :
-    (((i : ι) → G i) ⧸ Submodule.pi Set.univ p) ≃L[R] ((i : ι) → G i ⧸ p i) where
-  toLinearEquiv := Submodule.quotientPi p
-  continuous_toFun := by
-    apply Continuous.quotient_lift
-    exact continuous_pi (fun i => Continuous.comp continuous_quot_mk (continuous_apply _))
-  continuous_invFun := by
-    rw [show (quotientPi p).invFun = fun a => (quotientPi p).invFun a from rfl]
-    simp only [quotientPi, quotientPi_aux.toFun, quotientPi_aux.invFun, piQuotientLift,
-      LinearMap.lsum_apply, LinearMap.coe_sum, LinearMap.coe_comp, LinearMap.coe_proj,
-      LinearEquiv.invFun_eq_symm, LinearEquiv.coe_symm_mk, Finset.sum_apply, Function.comp_apply,
-      Function.eval]
-    refine continuous_finsetSum _ (fun i _ => ?_)
-    apply Continuous.comp ?_ (continuous_apply _)
-    apply Continuous.quotient_lift <| Continuous.comp (continuous_quot_mk) (continuous_single _)
+    (((i : ι) → G i) ⧸ Submodule.pi Set.univ p) ≃L[R] ((i : ι) → G i ⧸ p i) :=
+  -- Resolve `ContinuousAdd` on the quotient through the topological additive-group structure,
+  -- so typeclass search never explores the failing `IsSemitopologicalSemiring.toContinuousAdd`
+  -- branch (which would force an expensive `NonUnitalNonAssocSemiring (… ⧸ …)` search).
+  letI : ContinuousAdd (((i : ι) → G i) ⧸ Submodule.pi Set.univ p) :=
+    IsTopologicalAddGroup.toContinuousAdd
+  { toLinearEquiv := Submodule.quotientPi p
+    continuous_toFun := by
+      apply Continuous.quotient_lift
+      exact continuous_pi (fun i => Continuous.comp continuous_quot_mk (continuous_apply _))
+    continuous_invFun := by
+      rw [show (quotientPi p).invFun = fun a => (quotientPi p).invFun a from rfl]
+      simp only [quotientPi, quotientPi_aux.toFun, quotientPi_aux.invFun, piQuotientLift,
+        LinearMap.lsum_apply, LinearMap.coe_sum, LinearMap.coe_comp, LinearMap.coe_proj,
+        LinearEquiv.invFun_eq_symm, LinearEquiv.coe_symm_mk, Finset.sum_apply, Function.comp_apply,
+        Function.eval]
+      refine continuous_finsetSum _ (fun i _ => ?_)
+      apply Continuous.comp ?_ (continuous_apply _)
+      apply Continuous.quotient_lift <| Continuous.comp (continuous_quot_mk) (continuous_single _) }
