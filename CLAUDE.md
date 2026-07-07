@@ -29,9 +29,9 @@ graph TD
     START((Start Task)) --> TIME[Time all files]
     TIME --> PROFILE[Profile declarations]
     PROFILE --> TRACE[Get trace reports]
-    TRACE --> REPORT[Product final report]
+    TRACE --> REPORT[Produce final report]
     REPORT --> LOG[Record to log]
-    LOG --> STOP
+    LOG --> STOP((Stop Task))
 ```
 
 ### 📋 Process State Definitions
