@@ -32,15 +32,21 @@ import subprocess
 import sys
 from pathlib import Path
 
+import cache_paths
+
 _HERE = Path(__file__).resolve().parent
 _PROJECT_ROOT = _HERE.parent
 
-# Persistent cache for multi-pass workflows, sitting alongside log.jsonl.
-# Per-decl captures and reports accumulate under .cache/synth_trace/.
+# Per-decl captures and reports accumulate under .cache/Pass_<n>/synth_trace/.
 _CACHE_DIR = _PROJECT_ROOT / ".cache"
-_TRACE_DIR = _CACHE_DIR / "synth_trace"
-# Fallback locations used when no `label` is supplied.
+_TRACE_SUBDIR = "synth_trace"
+# Fallback location used when no `label`/`path` is supplied (top-level, legacy).
 _LEGACY_TRACE = _CACHE_DIR / "synth_trace_raw.txt"
+
+
+def _trace_dir(pass_no=None):
+    """`.cache/Pass_<n>/synth_trace`, created."""
+    return cache_paths.pass_subdir(_TRACE_SUBDIR, pass_no)
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "synth-trace", "version": "1.0.0"}
@@ -84,7 +90,16 @@ TOOLS = [
                     "type": "boolean",
                     "description": (
                         "Also write the report to "
-                        ".cache/synth_trace/<label>.report.txt (default true)."
+                        ".cache/Pass_<n>/synth_trace/<label>.report.txt (default true)."
+                    ),
+                },
+                "pass": {
+                    "type": "integer",
+                    "description": (
+                        "Pass number: dumps/reports live under "
+                        ".cache/Pass_<n>/synth_trace/. Also updates "
+                        ".cache/current_pass. Defaults to the current pass pointer "
+                        "(or 1 if unset)."
                     ),
                 },
             },
@@ -127,7 +142,16 @@ TOOLS = [
                 },
                 "write_output": {
                     "type": "boolean",
-                    "description": "Write the report to .cache/synth_trace/<decl>.report.txt (default true).",
+                    "description": "Write the report to .cache/Pass_<n>/synth_trace/<decl>.report.txt (default true).",
+                },
+                "pass": {
+                    "type": "integer",
+                    "description": (
+                        "Pass number: dump + report go under "
+                        ".cache/Pass_<n>/synth_trace/. Also updates "
+                        ".cache/current_pass. Defaults to the current pass pointer "
+                        "(or 1 if unset)."
+                    ),
                 },
             },
             "required": ["file"],
@@ -377,19 +401,20 @@ def _slugify(s: str) -> str:
     return _SLUG.sub("_", s.strip()).strip("_") or "synth_trace"
 
 
-def _resolve_input(label: str | None, path: str | None) -> Path:
-    """Locate the raw dump: explicit `path` wins, else `.cache/synth_trace/
-    <label>.raw.txt`, else the legacy flat location."""
+def _resolve_input(label: str | None, path: str | None, pass_no=None) -> Path:
+    """Locate the raw dump: explicit `path` wins, else
+    `.cache/Pass_<n>/synth_trace/<label>.raw.txt`, else the legacy flat location."""
     if path:
         p = Path(path)
         return p if p.is_absolute() else _PROJECT_ROOT / p
     if label:
-        return _TRACE_DIR / f"{_slugify(label)}.raw.txt"
+        return _trace_dir(pass_no) / f"{_slugify(label)}.raw.txt"
     return _LEGACY_TRACE
 
 
-def _run(label: str | None, path: str | None, top: int, write_output: bool) -> str:
-    p = _resolve_input(label, path)
+def _run(label: str | None, path: str | None, top: int, write_output: bool,
+         pass_no=None) -> str:
+    p = _resolve_input(label, path, pass_no)
     if not p.is_file():
         return f"error: trace file not found: {p}"
     report = analyze(p.read_text(errors="replace"), top=top)
@@ -397,8 +422,7 @@ def _run(label: str | None, path: str | None, top: int, write_output: bool) -> s
         return report
     # Name the report after the label, or fall back to the input file's stem.
     slug = _slugify(label) if label else _slugify(p.stem.replace(".raw", ""))
-    _TRACE_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = _TRACE_DIR / f"{slug}.report.txt"
+    report_path = _trace_dir(pass_no) / f"{slug}.report.txt"
     report_path.write_text(report + "\n")
     return f"{report}\n\n(written to {report_path.relative_to(_PROJECT_ROOT)})"
 
@@ -437,7 +461,7 @@ def _block_start(lines: list[str], idx: int) -> int:
 
 
 def capture(file: str, decl: str | None, line: int | None,
-            top: int, write_output: bool) -> str:
+            top: int, write_output: bool, pass_no=None) -> str:
     src = Path(file)
     if not src.is_absolute():
         src = _PROJECT_ROOT / src
@@ -462,8 +486,8 @@ def capture(file: str, decl: str | None, line: int | None,
     ins = _block_start(lines, decl_idx)
     label = decl or f"{src.stem}_L{line}"
     slug = _slugify(label)
-    _TRACE_DIR.mkdir(parents=True, exist_ok=True)
-    raw_path = _TRACE_DIR / f"{slug}.raw.txt"
+    trace_dir = _trace_dir(pass_no)
+    raw_path = trace_dir / f"{slug}.raw.txt"
 
     rel = src.relative_to(_PROJECT_ROOT) if src.is_relative_to(_PROJECT_ROOT) else src
     modified = lines[:ins] + [_OPTION_LINE] + lines[ins:]
@@ -494,7 +518,7 @@ def capture(file: str, decl: str | None, line: int | None,
     report = analyze(trace_text, top=top)
     if not write_output:
         return report
-    report_path = _TRACE_DIR / f"{slug}.report.txt"
+    report_path = trace_dir / f"{slug}.report.txt"
     report_path.write_text(report + "\n")
     return (f"{report}\n\n(trace: {raw_path.relative_to(_PROJECT_ROOT)}  |  "
             f"report: {report_path.relative_to(_PROJECT_ROOT)})")
@@ -528,6 +552,7 @@ def _handle(msg: dict) -> dict | None:
                     path=args.get("path"),
                     top=int(args.get("top", 15)),
                     write_output=bool(args.get("write_output", True)),
+                    pass_no=args.get("pass"),
                 )
             elif name == "capture_synth_trace":
                 text = capture(
@@ -536,6 +561,7 @@ def _handle(msg: dict) -> dict | None:
                     line=args.get("line"),
                     top=int(args.get("top", 15)),
                     write_output=bool(args.get("write_output", True)),
+                    pass_no=args.get("pass"),
                 )
             else:
                 return _err(msg_id, -32602, f"Unknown tool: {name}")

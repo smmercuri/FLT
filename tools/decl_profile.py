@@ -39,8 +39,10 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 _PROJECT_ROOT = _HERE.parent
 
+import cache_paths
+
 _CACHE_DIR = _PROJECT_ROOT / ".cache"
-_PROFILE_DIR = _CACHE_DIR / "decl_profile"
+_PROFILE_SUBDIR = "decl_profile"  # under .cache/Pass_<n>/
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "decl-profile", "version": "2.0.0"}
@@ -71,7 +73,16 @@ TOOLS = [
                     "type": "boolean",
                     "description": (
                         "Write report + machine-readable ranking to "
-                        ".cache/decl_profile/<module>.{report.txt,json} (default true)."
+                        ".cache/Pass_<n>/decl_profile/<module>.{report.txt,json} "
+                        "(default true)."
+                    ),
+                },
+                "pass": {
+                    "type": "integer",
+                    "description": (
+                        "Pass number: output goes under .cache/Pass_<n>/. Also "
+                        "updates .cache/current_pass. Defaults to the current pass "
+                        "pointer (or 1 if unset)."
                     ),
                 },
             },
@@ -197,7 +208,7 @@ def _build_report(module, ranked, top, note):
 # Core: parse decls -> inject markers -> compile -> restore -> zip -> rank
 # --------------------------------------------------------------------------- #
 
-def profile_file(file, top, write_output):
+def profile_file(file, top, write_output, pass_no=None):
     src = Path(file)
     if not src.is_absolute():
         src = _PROJECT_ROOT / src
@@ -259,9 +270,9 @@ def profile_file(file, top, write_output):
     if not write_output:
         return report
 
-    _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = _PROFILE_DIR / f"{module}.report.txt"
-    json_path = _PROFILE_DIR / f"{module}.json"
+    profile_dir = cache_paths.pass_subdir(_PROFILE_SUBDIR, pass_no)
+    report_path = profile_dir / f"{module}.report.txt"
+    json_path = profile_dir / f"{module}.json"
     report_path.write_text(report + "\n")
     json_path.write_text(json.dumps({
         "module": module,
@@ -303,6 +314,7 @@ def _handle(msg):
                 file=args.get("file"),
                 top=int(args.get("top", 25)),
                 write_output=bool(args.get("write_output", True)),
+                pass_no=args.get("pass"),
             )
             return _ok(msg_id, {"content": [{"type": "text", "text": text}]})
         except Exception as e:  # noqa: BLE001

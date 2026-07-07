@@ -13,10 +13,11 @@ Exposed tool:
             time lake env lean --profile <file>
 
         capture its `--profile` output, compute
-        (total wall time) - (import time), i.e. the time Lean spent on the
-        file's OWN content after its imports finished loading, then divide that
-        by the number of top-level declarations in the file and rank the modules
-        by this per-declaration own time. The wall time is the `real` figure
+        own_s = (total wall time) - (import time), i.e. the total time Lean
+        spent on the file's OWN content after its imports finished loading, and
+        rank the modules by this total own time (slowest first). The
+        per-declaration figure own_s / #declarations is also reported as a
+        secondary column. The wall time is the `real` figure
         `time` would report; it is measured in-process for portability (Windows
         has no `time` builtin), which is exactly equivalent. Declarations are
         counted by scanning the `.lean` source for declaration keywords.
@@ -36,13 +37,15 @@ import time
 import tomllib
 from pathlib import Path
 
+import cache_paths
+
 # Resolve paths regardless of the current working directory.
 _HERE = Path(__file__).resolve().parent
 _PROJECT_ROOT = _HERE.parent
 _LAKEFILE = _PROJECT_ROOT / "lakefile.toml"
 _CACHE_DIR = _PROJECT_ROOT / ".cache"
 DEFAULT_CLOSURE_JSON = _CACHE_DIR / "flt_import_closure_output.json"
-DEFAULT_OUTPUT = _CACHE_DIR / "flt_profile_ranking.json"
+OUTPUT_NAME = "flt_profile_ranking.json"  # written under .cache/Pass_<n>/
 DEFAULT_TIMEOUT = 900  # seconds per file
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -53,19 +56,42 @@ TOOLS = [
         "name": "flt_profile_ranking",
         "description": (
             "Run `time lake env lean --profile <file>` on every FLT module in "
-            ".cache/flt_import_closure_output.json and return a ranked list of "
-            "(total wall time - import time) / (number of declarations) per file "
-            "-- i.e. the time Lean spent elaborating the file's OWN content (with "
-            "the cost of loading its imports subtracted out), divided by the "
-            "number of top-level declarations in the file. Slowest per-declaration "
-            "own-time first. Results are "
-            "also written to .cache/flt_profile_ranking.json. NOTE: requires the "
-            "Mathlib/FLT oleans to be built (e.g. `lake exe cache get`), else "
-            "every file errors at the import stage."
+            ".cache/flt_import_closure_output.json, measuring own_s = (total wall "
+            "time - import time) per file -- the total time Lean spent elaborating "
+            "the file's OWN content, with imports subtracted out -- and the "
+            "per-declaration figure own_s_per_decl = own_s / #declarations. Both "
+            "are reported for every module. The `rank_by` argument chooses the sort "
+            "key: `own_s` (default) surfaces the most expensive files overall "
+            "(typically nearer the root of the import graph); `s/decl` surfaces "
+            "files with a pathologically slow individual declaration (typically "
+            "leaf nodes, where a fix propagates upward). Results are also written "
+            "to .cache/Pass_<n>/flt_profile_ranking.json (see the `pass` argument). "
+            "NOTE: requires the Mathlib/FLT oleans to be built (e.g. `lake exe "
+            "cache get`), else every file errors at the import stage."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
+                "pass": {
+                    "type": "integer",
+                    "description": (
+                        "Pass number: results are written under .cache/Pass_<n>/. "
+                        "Passing it also updates .cache/current_pass so the other "
+                        "tools in this pass write to the same place. Defaults to the "
+                        "current pass pointer (or 1 if unset)."
+                    ),
+                },
+                "rank_by": {
+                    "type": "string",
+                    "enum": ["own_s", "s/decl"],
+                    "description": (
+                        "Which metric to sort the ranking by. `own_s` (default) = "
+                        "total own elaboration time per file (biggest total cost "
+                        "first). `s/decl` = own time per top-level declaration "
+                        "(worst individual declaration first). Both figures are "
+                        "always shown regardless of this choice."
+                    ),
+                },
                 "closure_json": {
                     "type": "string",
                     "description": (
@@ -311,21 +337,51 @@ def _load_modules(closure_json: Path) -> list[str]:
     return list(modules)
 
 
-def _rank_key(r: dict):
-    """Sort key: slowest own-time-per-declaration first, missing values last."""
-    return (r["own_s_per_decl"] is None, -(r["own_s_per_decl"] or 0.0))
+# Which record field each user-facing `rank_by` value sorts on. Aliases let a
+# caller say "own_s"/"total" or "s/decl"/"avg" interchangeably.
+DEFAULT_RANK_BY = "own_s"
+_RANK_BY_FIELD = {
+    "own_s": "own_s",
+    "total": "own_s",
+    "own": "own_s",
+    "s/decl": "own_s_per_decl",
+    "own_s_per_decl": "own_s_per_decl",
+    "per_decl": "own_s_per_decl",
+    "avg": "own_s_per_decl",
+}
+# Human-readable description of each ranking field, for headers / metadata.
+_RANK_FIELD_TITLE = {
+    "own_s": "total own elaboration time (total wall time - import time)",
+    "own_s_per_decl": "own elaboration time per declaration "
+    "((total wall time - import time) / #declarations)",
+}
 
 
-def _render(records: list[dict], skipped_no_import: int) -> str:
-    """Render the ranked records as a plain-text table (slowest per-decl first)."""
-    ranked = sorted(records, key=_rank_key)
+def _resolve_rank_field(rank_by: str | None) -> str:
+    """Map a user-facing `rank_by` value to the record field it sorts on."""
+    key = (rank_by or DEFAULT_RANK_BY).strip().lower()
+    if key not in _RANK_BY_FIELD:
+        allowed = "own_s, s/decl"
+        raise ValueError(f"unknown rank_by {rank_by!r}; choose one of: {allowed}")
+    return _RANK_BY_FIELD[key]
+
+
+def _rank_key(r: dict, field: str):
+    """Sort key on `field`: largest value first, missing values last."""
+    return (r[field] is None, -(r[field] or 0.0))
+
+
+def _render(records: list[dict], skipped_no_import: int, rank_field: str) -> str:
+    """Render the ranked records as a plain-text table, sorted by `rank_field`
+    (largest first). Both the `own_s` and `s/decl` columns are always shown; the
+    header names whichever one is the active sort key."""
+    ranked = sorted(records, key=lambda r: _rank_key(r, rank_field))
     lines = [
-        "Ranked by own elaboration time per declaration "
-        "((total wall time - import time) / #declarations), slowest first.",
+        f"Ranked by {_RANK_FIELD_TITLE[rank_field]}, slowest first.",
         "",
-        f"{'rank':>4}  {'s/decl':>10}  {'own_s':>8}  {'decls':>6}  "
+        f"{'rank':>4}  {'own_s':>8}  {'s/decl':>10}  {'decls':>6}  "
         f"{'total_s':>8}  {'import_s':>8}  module",
-        f"{'':->4}  {'':->10}  {'':->8}  {'':->6}  {'':->8}  {'':->8}  {'':->40}",
+        f"{'':->4}  {'':->8}  {'':->10}  {'':->6}  {'':->8}  {'':->8}  {'':->40}",
     ]
     for i, r in enumerate(ranked, 1):
         per = f"{r['own_s_per_decl']:.6f}" if r["own_s_per_decl"] is not None else "-"
@@ -335,14 +391,19 @@ def _render(records: list[dict], skipped_no_import: int) -> str:
         imp = f"{r['import_s']:.3f}" if r["import_s"] is not None else "-"
         flag = f"  [ERROR: {r['error']}]" if r["error"] else ""
         lines.append(
-            f"{i:>4}  {per:>10}  {own:>8}  {decls:>6}  "
+            f"{i:>4}  {own:>8}  {per:>10}  {decls:>6}  "
             f"{total:>8}  {imp:>8}  {r['module']}{flag}"
         )
     if skipped_no_import:
+        reason = (
+            "missing import time so own_s could not be computed"
+            if rank_field == "own_s"
+            else "missing import time or zero declarations"
+        )
         lines.append("")
         lines.append(
-            f"Note: {skipped_no_import} file(s) had no per-declaration own time "
-            "(sorted last); missing import time or zero declarations."
+            f"Note: {skipped_no_import} file(s) had no {_RANK_FIELD_TITLE[rank_field]} "
+            f"value (sorted last); {reason}."
         )
     return "\n".join(lines)
 
@@ -353,7 +414,10 @@ def _run_ranking(
     timeout: float,
     limit: int | None,
     write_output: bool,
+    rank_by: str | None = None,
+    pass_no=None,
 ) -> str:
+    rank_field = _resolve_rank_field(rank_by)
     if modules is None:
         cj = closure_json or DEFAULT_CLOSURE_JSON
         if not Path(cj).is_file():
@@ -363,19 +427,24 @@ def _run_ranking(
         modules = modules[:limit]
 
     records = [_profile_one(m, timeout) for m in modules]
-    ranked = sorted(records, key=_rank_key)
-    skipped_no_import = sum(1 for r in records if r["own_s_per_decl"] is None)
-    text = _render(records, skipped_no_import)
+    ranked = sorted(records, key=lambda r: _rank_key(r, rank_field))
+    skipped_no_import = sum(1 for r in records if r[rank_field] is None)
+    text = _render(records, skipped_no_import, rank_field)
 
     if write_output:
-        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        DEFAULT_OUTPUT.write_text(
+        out_path = cache_paths.pass_dir(pass_no) / OUTPUT_NAME
+        out_path.write_text(
             json.dumps(
                 {
                     "command": "time lake env lean --profile <file>",
+                    "pass": cache_paths.resolve_pass(pass_no),
+                    "rank_by": rank_field,
                     "metric": (
-                        "own_s_per_decl = (total_s - import_s) / decl_count "
-                        "(own elaboration wall time per top-level declaration)"
+                        f"ranked by {rank_field}. own_s = total_s - import_s "
+                        "(total own elaboration wall time, imports subtracted); "
+                        "own_s_per_decl = own_s / decl_count (per-declaration "
+                        "figure). Both are reported for every module regardless of "
+                        "which one is the sort key."
                     ),
                     "count": len(records),
                     "ranking": ranked,
@@ -384,7 +453,7 @@ def _run_ranking(
             )
             + "\n"
         )
-        rel = DEFAULT_OUTPUT.relative_to(_PROJECT_ROOT)
+        rel = out_path.relative_to(_PROJECT_ROOT)
         text += f"\n\n(written to {str(rel).replace(chr(92), '/')})"
     return text
 
@@ -421,6 +490,8 @@ def _handle(msg: dict) -> dict | None:
                 timeout=float(args.get("timeout", DEFAULT_TIMEOUT)),
                 limit=args.get("limit"),
                 write_output=bool(args.get("write_output", True)),
+                rank_by=args.get("rank_by"),
+                pass_no=args.get("pass"),
             )
             return _ok(msg_id, {"content": [{"type": "text", "text": text}]})
         except Exception as e:  # noqa: BLE001 - surface any failure to the client
@@ -445,11 +516,18 @@ def _cli() -> int:
     argv = sys.argv[1:]
     limit = None
     timeout = DEFAULT_TIMEOUT
+    rank_by = None
+    pass_no = None
     if "--limit" in argv:
         limit = int(argv[argv.index("--limit") + 1])
     if "--timeout" in argv:
         timeout = float(argv[argv.index("--timeout") + 1])
-    print(_run_ranking(None, None, timeout, limit, write_output=True))
+    if "--rank-by" in argv:
+        rank_by = argv[argv.index("--rank-by") + 1]
+    if "--pass" in argv:
+        pass_no = int(argv[argv.index("--pass") + 1])
+    print(_run_ranking(None, None, timeout, limit, write_output=True,
+                       rank_by=rank_by, pass_no=pass_no))
     return 0
 
 

@@ -32,13 +32,21 @@ import subprocess
 import sys
 from pathlib import Path
 
+import cache_paths
+
 _HERE = Path(__file__).resolve().parent
 _PROJECT_ROOT = _HERE.parent
 
-# Persistent cache for multi-pass workflows, sitting alongside log.jsonl.
+# Per-decl captures and reports accumulate under .cache/Pass_<n>/isdefeq/.
 _CACHE_DIR = _PROJECT_ROOT / ".cache"
-_TRACE_DIR = _CACHE_DIR / "isdefeq"
+_TRACE_SUBDIR = "isdefeq"
+# Fallback location used when no `label`/`path` is supplied (top-level, legacy).
 _LEGACY_TRACE = _CACHE_DIR / "isdefeq_raw.txt"
+
+
+def _trace_dir(pass_no=None):
+    """`.cache/Pass_<n>/isdefeq`, created."""
+    return cache_paths.pass_subdir(_TRACE_SUBDIR, pass_no)
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "isdefeq-trace", "version": "1.0.0"}
@@ -71,7 +79,15 @@ TOOLS = [
                 "top": {"type": "integer", "description": "Rows per ranking (default 15)."},
                 "write_output": {
                     "type": "boolean",
-                    "description": "Write report to .cache/isdefeq/<label>.report.txt (default true).",
+                    "description": "Write report to .cache/Pass_<n>/isdefeq/<label>.report.txt (default true).",
+                },
+                "pass": {
+                    "type": "integer",
+                    "description": (
+                        "Pass number: dumps/reports live under "
+                        ".cache/Pass_<n>/isdefeq/. Also updates .cache/current_pass. "
+                        "Defaults to the current pass pointer (or 1 if unset)."
+                    ),
                 },
             },
         },
@@ -114,7 +130,15 @@ TOOLS = [
                 "top": {"type": "integer", "description": "Rows per ranking (default 15)."},
                 "write_output": {
                     "type": "boolean",
-                    "description": "Write report to .cache/isdefeq/<decl>.report.txt (default true).",
+                    "description": "Write report to .cache/Pass_<n>/isdefeq/<decl>.report.txt (default true).",
+                },
+                "pass": {
+                    "type": "integer",
+                    "description": (
+                        "Pass number: dump + report go under "
+                        ".cache/Pass_<n>/isdefeq/. Also updates .cache/current_pass. "
+                        "Defaults to the current pass pointer (or 1 if unset)."
+                    ),
                 },
             },
             "required": ["file"],
@@ -357,25 +381,24 @@ def _slugify(s: str) -> str:
     return _SLUG.sub("_", s.strip()).strip("_") or "isdefeq"
 
 
-def _resolve_input(label, path):
+def _resolve_input(label, path, pass_no=None):
     if path:
         p = Path(path)
         return p if p.is_absolute() else _PROJECT_ROOT / p
     if label:
-        return _TRACE_DIR / f"{_slugify(label)}.raw.txt"
+        return _trace_dir(pass_no) / f"{_slugify(label)}.raw.txt"
     return _LEGACY_TRACE
 
 
-def _run(label, path, top, write_output):
-    p = _resolve_input(label, path)
+def _run(label, path, top, write_output, pass_no=None):
+    p = _resolve_input(label, path, pass_no)
     if not p.is_file():
         return f"error: trace file not found: {p}"
     report = analyze(p.read_text(errors="replace"), top=top)
     if not write_output:
         return report
     slug = _slugify(label) if label else _slugify(p.stem.replace(".raw", ""))
-    _TRACE_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = _TRACE_DIR / f"{slug}.report.txt"
+    report_path = _trace_dir(pass_no) / f"{slug}.report.txt"
     report_path.write_text(report + "\n")
     return f"{report}\n\n(written to {report_path.relative_to(_PROJECT_ROOT)})"
 
@@ -410,7 +433,7 @@ def _block_start(lines, idx):
     return i
 
 
-def capture(file, decl, line, pp_all, top, write_output):
+def capture(file, decl, line, pp_all, top, write_output, pass_no=None):
     src = Path(file)
     if not src.is_absolute():
         src = _PROJECT_ROOT / src
@@ -435,8 +458,8 @@ def capture(file, decl, line, pp_all, top, write_output):
     ins = _block_start(lines, decl_idx)
     label = decl or f"{src.stem}_L{line}"
     slug = _slugify(label)
-    _TRACE_DIR.mkdir(parents=True, exist_ok=True)
-    raw_path = _TRACE_DIR / f"{slug}.raw.txt"
+    trace_dir = _trace_dir(pass_no)
+    raw_path = trace_dir / f"{slug}.raw.txt"
 
     inject = ([_PPALL_LINE] if pp_all else []) + [_OPTION_LINE]
     rel = src.relative_to(_PROJECT_ROOT) if src.is_relative_to(_PROJECT_ROOT) else src
@@ -467,7 +490,7 @@ def capture(file, decl, line, pp_all, top, write_output):
     report = analyze(trace_text, top=top)
     if not write_output:
         return report
-    report_path = _TRACE_DIR / f"{slug}.report.txt"
+    report_path = trace_dir / f"{slug}.report.txt"
     report_path.write_text(report + "\n")
     return (f"{report}\n\n(trace: {raw_path.relative_to(_PROJECT_ROOT)}  |  "
             f"report: {report_path.relative_to(_PROJECT_ROOT)})")
@@ -501,6 +524,7 @@ def _handle(msg):
                     path=args.get("path"),
                     top=int(args.get("top", 15)),
                     write_output=bool(args.get("write_output", True)),
+                    pass_no=args.get("pass"),
                 )
             elif name == "capture_isdefeq_trace":
                 text = capture(
@@ -510,6 +534,7 @@ def _handle(msg):
                     pp_all=bool(args.get("pp_all", False)),
                     top=int(args.get("top", 15)),
                     write_output=bool(args.get("write_output", True)),
+                    pass_no=args.get("pass"),
                 )
             else:
                 return _err(msg_id, -32602, f"Unknown tool: {name}")
